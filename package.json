@@ -1,0 +1,12 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.1.0",
+  "description": "DSH Desktop - DeepSeek Harness 桌面启动器",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0"
+  }
+}
