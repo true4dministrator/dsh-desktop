@@ -1,0 +1,15 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+dist-build/
+.workbuddy/
+*.log
+.DS_Store
+Thumbs.db
+
+# 本地调试产物（不入库）
+scripts/*.ico
+scripts/*_preview.png
+scripts/cmp_*.png
+scripts/cmp_*.ico
+scripts/extracted.ico
