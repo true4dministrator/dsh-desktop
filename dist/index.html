@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:">
+<title>DSH Desktop</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #101014; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    color: #e8e8ee; user-select: none;
+  }
+  .wrap { text-align: center; }
+  .splash {
+    width: 220px; height: 220px; margin: 0 auto 24px;
+    border-radius: 20px; object-fit: cover;
+    border: 1px solid rgba(255,255,255,0.08);
+    animation: pop .5s ease-out;
+  }
+  @keyframes pop {
+    0% { transform: scale(.85); opacity: 0; }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  .text { font-size: 15px; color: #a9a9b8; }
+  .dots { margin-top: 18px; font-size: 20px; color: #4d6bfe; letter-spacing: 6px; }
+  .dot { animation: blink 1.2s infinite; }
+  .dot:nth-child(2) { animation-delay: .2s; }
+  .dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 100% { opacity: .15; } 50% { opacity: 1; } }
+  .update-banner {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: none; align-items: center; gap: 10px;
+    background: #1a1a22; border: 1px solid rgba(77,107,254,0.5);
+    border-radius: 10px; padding: 10px 18px; font-size: 13px; color: #d0d0d8;
+    cursor: pointer; transition: background .15s;
+  }
+  .update-banner.show { display: flex; }
+  .update-banner:hover { background: #232330; }
+  .update-banner .badge {
+    background: #4d6bfe; color: #fff; border-radius: 6px;
+    padding: 3px 10px; font-size: 12px; font-weight: 500;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <img class="splash" src="splash.webp" alt="">
+    <div class="text">正在启动 DSH 服务…</div>
+    <div class="dots"><span class="dot">·</span><span class="dot">·</span><span class="dot">·</span></div>
+  </div>
+  <div class="update-banner" id="updateBanner">
+    <span class="badge">更新</span>
+    <span id="updateText">检测到 dsh 新版本</span>
+  </div>
+
+<script>
+(function () {
+  if (!window.__TAURI__) return;
+  var listen = window.__TAURI__.event.listen;
+  var invoke = window.__TAURI__.core.invoke;
+
+  // dsh 新版本提示（Rust 端在后台检测到新版本后 emit update-available）
+  listen('update-available', function (e) {
+    var banner = document.getElementById('updateBanner');
+    var text = document.getElementById('updateText');
+    var p = e.payload || {};
+    text.textContent = 'dsh ' + p.latest + ' 已发布' + (p.current ? '（当前 ' + p.current + '）' : '') + '，点此更新';
+    banner.classList.add('show');
+    banner.onclick = function () {
+      banner.classList.remove('show');
+      invoke('install_dsh').then(function (r) {
+        if (r && r.ok) {
+          text.textContent = '更新完成，请重启 dsh 服务';
+          banner.classList.add('show');
+          banner.onclick = null;
+        } else {
+          text.textContent = '更新失败：' + ((r && r.error) || '未知错误');
+          banner.classList.add('show');
+        }
+      }).catch(function (err) {
+        text.textContent = '更新失败：' + err;
+        banner.classList.add('show');
+      });
+    };
+  }).catch(function () {});
+})();
+</script>
+</body>
+</html>
