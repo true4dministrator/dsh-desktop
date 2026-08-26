@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'">
+<title>DSH Desktop - 安装引导</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #101014; color: #e8e8ee; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    user-select: none; padding: 24px;
+  }
+  .wrap { max-width: 640px; width: 100%; }
+  .header { text-align: center; margin-bottom: 32px; }
+  .splash {
+    width: 120px; height: 120px; margin: 0 auto 18px;
+    border-radius: 20px; object-fit: cover;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  h1 { font-size: 20px; font-weight: 500; margin-bottom: 8px; }
+  .sub { font-size: 13px; color: #8a8a99; }
+
+  .card {
+    background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 12px; padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; font-weight: 500; margin-bottom: 8px; color: #d0d0d8; }
+  .card p { font-size: 13px; line-height: 1.6; color: #a0a0ad; }
+  .card code {
+    background: #25252e; padding: 2px 6px; border-radius: 4px;
+    font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px;
+    color: #d6d6e0;
+  }
+  .check-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; font-size: 13px; color: #a0a0ad;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .check-row:last-child { border-bottom: none; }
+  .check-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .check-dot.ok { background: #5dcb8d; }
+  .check-dot.miss { background: #e24b4a; }
+  .check-dot.info { background: #4d6bfe; }
+
+  .btn {
+    display: block; width: 100%; padding: 14px;
+    background: #4d6bfe; color: #fff; border: none; border-radius: 10px;
+    font-size: 15px; font-weight: 500; cursor: pointer; transition: background .15s;
+  }
+  .btn:hover { background: #5a76ff; }
+  .btn:disabled { background: #3a3a48; color: #7a7a88; cursor: not-allowed; }
+
+  .log {
+    margin-top: 14px; max-height: 240px; overflow-y: auto;
+    background: #0a0a0e; border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px; padding: 10px 12px;
+    font-family: "Cascadia Code", "Consolas", monospace; font-size: 11.5px;
+    color: #a8a8b6; line-height: 1.5; display: none;
+  }
+  .log.show { display: block; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+
+  .status { margin-top: 12px; font-size: 13px; text-align: center; }
+  .status.success { color: #5dcb8d; }
+  .status.error { color: #e24b4a; }
+  .status.info { color: #8a8a99; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <img class="splash" src="splash.webp" alt="">
+      <h1>DSH Desktop</h1>
+      <div class="sub" id="topSub">检测运行环境…</div>
+    </div>
+
+    <div class="card" id="cardCheck">
+      <h2 id="cardTitle">检测中</h2>
+      <div id="checkDetail">正在检查 dsh / pnpm / npm…</div>
+    </div>
+
+    <div id="actionArea" style="display:none;">
+      <button class="btn" id="btnInstall">下一步</button>
+      <div class="log" id="log"></div>
+      <div class="status" id="status"></div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
+
+  const topSub = document.getElementById('topSub');
+  const cardTitle = document.getElementById('cardTitle');
+  const checkDetail = document.getElementById('checkDetail');
+  const actionArea = document.getElementById('actionArea');
+  const btnInstall = document.getElementById('btnInstall');
+  const logEl = document.getElementById('log');
+  const statusEl = document.getElementById('status');
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = 'status ' + (cls || '');
+  }
+
+  function appendLog(line) {
+    if (!line) return;
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    div.textContent = line;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function renderEnv(env) {
+    const rows = [
+      { name: 'dsh (DeepSeek Harness CLI)', ok: env.dsh_installed, extra: env.dsh_version || '' },
+      { name: 'pnpm (dsh 插件管理依赖)', ok: env.pnpm_installed, extra: '' },
+      { name: 'npm (Node 包管理器)', ok: !!env.npm_version, extra: env.npm_version || '' }
+    ];
+    checkDetail.innerHTML = rows.map(r => {
+      const cls = r.ok ? 'ok' : 'miss';
+      const extra = r.extra ? '<span style="color:#6a6a78;margin-left:8px;">' + r.extra + '</span>' : '';
+      const tag = r.ok ? '✓' : '✗ 缺失';
+      return '<div class="check-row"><span class="check-dot ' + cls + '"></span><span>' +
+        r.name + '</span><span style="color:#6a6a78;">' + tag + '</span>' + extra + '</div>';
+    }).join('');
+  }
+
+  function openDshFlow() {
+    topSub.textContent = '✓ 环境就绪';
+    cardTitle.textContent = '环境检查通过';
+    checkDetail.innerHTML = 'dsh、pnpm、npm 都已就绪。点击下方按钮进入 DSH。';
+    btnInstall.textContent = '打开 DSH';
+    btnInstall.disabled = false;
+    actionArea.style.display = 'block';
+    btnInstall.onclick = () => {
+      btnInstall.disabled = true;
+      btnInstall.textContent = '正在进入…';
+      invoke('open_dsh').catch(e => { setStatus(String(e), 'error'); btnInstall.disabled = false; });
+    };
+  }
+
+  function installFlow(title, detailHtml, logEvent, cmdName, successMsg, afterOk) {
+    cardTitle.textContent = title;
+    checkDetail.innerHTML = detailHtml;
+    actionArea.style.display = 'block';
+    btnInstall.disabled = false;
+    logEl.classList.remove('show');
+
+    const un = listen(logEvent, e => appendLog(e.payload));
+    btnInstall.onclick = async () => {
+      btnInstall.disabled = true;
+      btnInstall.textContent = '安装中…';
+      logEl.classList.add('show');
+      logEl.innerHTML = '';
+      setStatus('正在安装，请稍候…', 'info');
+      try {
+        const result = await invoke(cmdName);
+        if (result.ok) {
+          setStatus(successMsg, 'success');
+          un.then(f => f());
+          btnInstall.textContent = '下一步';
+          btnInstall.disabled = false;
+          afterOk();
+        } else {
+          setStatus('安装失败：' + (result.error || '未知错误'), 'error');
+          btnInstall.textContent = '重试';
+          btnInstall.disabled = false;
+        }
+      } catch (e) {
+        setStatus('调用失败：' + e, 'error');
+        btnInstall.textContent = '重试';
+        btnInstall.disabled = false;
+      }
+    };
+  }
+
+  async function run() {
+    let env = null;
+    try {
+      env = await invoke('check_env');
+    } catch (e) {
+      cardTitle.textContent = '检测失败';
+      checkDetail.innerHTML = '无法读取环境信息：' + e;
+      return;
+    }
+
+    renderEnv(env);
+
+    if (!env.dsh_installed) {
+      // 缺 dsh → 先装 dsh
+      topSub.textContent = '首次运行 · 需要安装 dsh';
+      installFlow(
+        '安装 dsh',
+        '本机还没安装 <code>dsh</code>（DeepSeek Harness CLI）。点击下方按钮，应用会自动从 npm 下载安装。<br><br>需要本机已安装 Node.js（<a href="https://nodejs.org" target="_blank" style="color:#4d6bfe;">nodejs.org</a>）。',
+        'install-log', 'install_dsh', '✓ dsh 安装成功！', async () => {
+          // 装完 dsh 后再检查一次环境（此时 pnpm/npm 可能仍需补齐）
+          try {
+            env = await invoke('check_env');
+            renderEnv(env);
+            if (!env.pnpm_installed || !env.npm_version) {
+              envSetupFlow(env);
+            } else {
+              openDshFlow();
+            }
+          } catch (e) {
+            openDshFlow();
+          }
+        }
+      );
+      return;
+    }
+
+    if (!env.pnpm_installed || !env.npm_version) {
+      envSetupFlow(env);
+      return;
+    }
+
+    openDshFlow();
+  }
+
+  function envSetupFlow(env) {
+    const missing = [];
+    if (!env.pnpm_installed) missing.push('pnpm');
+    if (!env.npm_version) missing.push('npm（未检测到）');
+    topSub.textContent = '需要补齐运行环境';
+    installFlow(
+      '安装依赖工具',
+      'dsh 已就绪，但还缺少：<code>' + missing.join('</code>、<code>') + '</code>。<br>' +
+      'pnpm 是 dsh 管理插件的必需工具，npm 建议保持最新。点击下方按钮一键补齐。',
+      'env-log', 'setup_node_env', '✓ 环境补齐完成！', openDshFlow
+    );
+  }
+
+  run();
+})();
+</script>
+</body>
+</html>
