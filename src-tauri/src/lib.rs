@@ -154,14 +154,32 @@ fn stop_service(app: &AppHandle) {
 /// 启动 dsh 服务并等待 ready，navigate 到 DSH UI。
 /// 已在跑则直接 navigate；启不动则交给日志。
 fn start_dsh_and_open(app: &AppHandle) {
+    // 自愈：启动前先清理可能残留的 task-board 锁（强杀 dsh 进程会留下）
+    cleanup_stale_taskboard_lock();
+
+    let h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if boot_dsh_once(&h) {
+            return;
+        }
+
+        // 自愈重试：再清一次锁 + 杀掉可能的残留子进程 + 重启
+        eprintln!("[dsh-desktop] boot failed, self-healing (clear lock + retry)…");
+        cleanup_stale_taskboard_lock();
+        if let Some(mut child) = h.state::<AppState>().service_child.lock().unwrap().take() {
+            kill_service_tree(&mut child);
+        }
+        boot_dsh_once(&h);
+    });
+}
+
+/// 一次完整的"检测 → 启动 → 等待就绪 → 跳转"。
+/// 返回是否成功就绪。
+fn boot_dsh_once(h: &AppHandle) -> bool {
     if service_running(PORT) {
         eprintln!("[dsh-desktop] dsh already listening on port {}", PORT);
-        if let Some(w) = app.get_webview_window("main") {
-            if let Ok(url) = DSH_URL.parse() {
-                let _ = w.navigate(url);
-            }
-        }
-        return;
+        navigate_to_dsh(h);
+        return true;
     }
 
     match start_service() {
@@ -170,31 +188,118 @@ fn start_dsh_and_open(app: &AppHandle) {
                 "[dsh-desktop] dsh spawned (pid={}), waiting for ready…",
                 child.id()
             );
-            *app.state::<AppState>().service_child.lock().unwrap() = Some(child);
+            *h.state::<AppState>().service_child.lock().unwrap() = Some(child);
         }
         Err(e) => {
             eprintln!("[dsh-desktop] failed to spawn dsh: {}", e);
-            return;
+            return false;
         }
     }
 
-    let h = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if wait_ready(PORT, READY_TIMEOUT_SECS) {
-            eprintln!("[dsh-desktop] dsh ready, navigating to {}", DSH_URL);
-            if let Some(w) = h.get_webview_window("main") {
-                if let Ok(url) = DSH_URL.parse() {
-                    let _ = w.navigate(url);
+    if wait_ready(PORT, READY_TIMEOUT_SECS) {
+        eprintln!("[dsh-desktop] dsh ready, navigating to {}", DSH_URL);
+        navigate_to_dsh(h);
+        true
+    } else {
+        eprintln!(
+            "[dsh-desktop] dsh did not become ready within {}s; check log at {:?}",
+            READY_TIMEOUT_SECS,
+            log_file_path()
+        );
+        false
+    }
+}
+
+fn navigate_to_dsh(h: &AppHandle) {
+    if let Some(w) = h.get_webview_window("main") {
+        if let Ok(url) = DSH_URL.parse() {
+            let _ = w.navigate(url);
+        }
+    }
+}
+
+// ───────────────────────── 自愈：task-board 锁清理 ─────────────────────────
+
+/// dsh 的 task-board 插件在强杀进程时会留下 `~/.dsh/task-board/ledger-v2.lock`，
+/// 导致后续 dsh 启动报 "ledger is already owned by process <pid>" 直接退出。
+/// 这里检查锁内 PID 是否存活：已死则删除锁（自愈）。
+fn cleanup_stale_taskboard_lock() {
+    let lock = taskboard_lock_path();
+    if !lock.exists() {
+        return;
+    }
+
+    match std::fs::read_to_string(&lock) {
+        Ok(content) => {
+            match extract_pid(&content) {
+                Some(pid) if pid_alive(pid) => {
+                    eprintln!(
+                        "[dsh-desktop] task-board lock held by live pid {}, keep",
+                        pid
+                    );
+                    return;
+                }
+                Some(pid) => {
+                    eprintln!(
+                        "[dsh-desktop] task-board lock pid {} is dead, removing stale lock",
+                        pid
+                    );
+                }
+                None => {
+                    eprintln!("[dsh-desktop] task-board lock unparseable, removing");
                 }
             }
-        } else {
-            eprintln!(
-                "[dsh-desktop] dsh did not become ready within {}s; check log at {:?}",
-                READY_TIMEOUT_SECS,
-                log_file_path()
-            );
         }
-    });
+        Err(e) => {
+            eprintln!("[dsh-desktop] cannot read task-board lock ({}), removing", e);
+        }
+    }
+
+    if std::fs::remove_file(&lock).is_ok() {
+        eprintln!("[dsh-desktop] stale task-board lock removed");
+    } else {
+        eprintln!("[dsh-desktop] failed to remove task-board lock");
+    }
+}
+
+fn taskboard_lock_path() -> std::path::PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    home.join(".dsh").join("task-board").join("ledger-v2.lock")
+}
+
+/// 从锁文件内容中提取 PID（数字，且大于 100，避免匹配到版本号等小数字）。
+fn extract_pid(content: &str) -> Option<u32> {
+    content
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u32>().ok())
+        .find(|p| *p > 100)
+}
+
+/// Windows：用 tasklist /FI 检查 PID 是否存活。
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid)])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_lowercase().contains(".exe"),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn pid_alive(pid: u32) -> bool {
+    // Unix：kill -0 探测
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 // ───────────────────────── Tauri Commands（前端 invoke） ─────────────────────────
