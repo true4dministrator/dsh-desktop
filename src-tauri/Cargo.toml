@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "DSH Desktop - DeepSeek Harness 桌面启动器"
 edition = "2021"
 rust-version = "1.77"
