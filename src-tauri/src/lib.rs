@@ -302,6 +302,57 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ───────────────────────── 辅助窗口移出屏幕（修复左上角黑框） ─────────────────────────
+
+/// 单实例插件的标记窗口（`<identifier>-siw`）和 tao 的事件窗口（`Tao Thread Event Target`）
+/// 会以 14x14 的小黑框残留在屏幕 (0,0)。它们必须常驻（单实例检测/消息循环依赖），
+/// 但可以把它们移到屏幕外（-32000,-32000，Windows 隐藏窗口的标准做法），
+/// 功能不受影响（FindWindow/消息接收不依赖可见位置）。
+#[cfg(windows)]
+fn move_helper_windows_offscreen() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let target_pid = lparam as u32;
+        let mut pid: u32 = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == target_pid {
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                GetWindowRect(hwnd, &mut rect);
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                // 只处理小型辅助窗口（主窗口 1280x820 远大于此）
+                if w > 0 && w <= 64 && h > 0 && h <= 64 {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOP,
+                        -32000,
+                        -32000,
+                        w,
+                        h,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+        1
+    }
+
+    unsafe {
+        EnumWindows(Some(callback), std::process::id() as LPARAM);
+    }
+}
+
+#[cfg(not(windows))]
+fn move_helper_windows_offscreen() {}
+
 // ───────────────────────── Tauri Commands（前端 invoke） ─────────────────────────
 
 #[derive(Serialize)]
@@ -681,5 +732,10 @@ pub fn run() {
         })
         .build(context)
         .expect("error while building tauri application")
-        .run(|_app_handle, _event| {});
+        .run(|_app_handle, event| {
+            // 事件循环就绪后，把单实例标记窗/tao 事件窗移出屏幕，避免左上角黑框
+            if let tauri::RunEvent::Ready = event {
+                move_helper_windows_offscreen();
+            }
+        });
 }
