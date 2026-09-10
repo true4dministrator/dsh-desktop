@@ -66,24 +66,35 @@
     var banner = document.getElementById('updateBanner');
     var text = document.getElementById('updateText');
     var p = e.payload || {};
-    text.textContent = 'dsh ' + p.latest + ' 已发布' + (p.current ? '（当前 ' + p.current + '）' : '') + '，点此更新';
-    banner.classList.add('show');
-    banner.onclick = function () {
-      banner.classList.remove('show');
-      invoke('install_dsh').then(function (r) {
+
+    function startUpdate() {
+      // 立即给反馈，避免"点了没反应"
+      text.textContent = '正在更新 dsh，约需 1-2 分钟…';
+      banner.onclick = null;
+      invoke('update_dsh').then(function (r) {
         if (r && r.ok) {
-          text.textContent = '更新完成，请重启 dsh 服务';
+          text.textContent = '✓ 更新完成，正在重启服务…';
           banner.classList.add('show');
-          banner.onclick = null;
+          // 重新拉起 dsh 服务并跳转（新版本生效）
+          invoke('open_dsh').catch(function (err) {
+            text.textContent = '重启服务失败：' + err;
+            banner.classList.add('show');
+          });
         } else {
-          text.textContent = '更新失败：' + ((r && r.error) || '未知错误');
+          text.textContent = '更新失败：' + ((r && r.error) || '未知错误') + '，点此重试';
           banner.classList.add('show');
+          banner.onclick = startUpdate;
         }
       }).catch(function (err) {
-        text.textContent = '更新失败：' + err;
+        text.textContent = '更新失败：' + err + '，点此重试';
         banner.classList.add('show');
+        banner.onclick = startUpdate;
       });
-    };
+    }
+
+    text.textContent = 'dsh ' + p.latest + ' 已发布' + (p.current ? '（当前 ' + p.current + '）' : '') + '，点此更新';
+    banner.classList.add('show');
+    banner.onclick = startUpdate;
   }).catch(function () {});
 })();
 </script>

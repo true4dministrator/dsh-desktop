@@ -831,13 +831,14 @@ dependencies = [
 
 [[package]]
 name = "dsh-desktop"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

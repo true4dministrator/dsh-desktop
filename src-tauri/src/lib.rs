@@ -7,10 +7,10 @@
 //! 4. 托盘菜单可选择「保留服务」或「停止服务」后退出
 //! 5. 首启检测 dsh CLI 是否安装，缺失则进入一键安装引导
 
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -36,14 +36,29 @@ const PAGE_INSTALL: &str = "install.html";
 /// 全局应用状态：dsh 子进程句柄，退出/托盘菜单需要访问。
 struct AppState {
     service_child: Mutex<Option<Child>>,
+    /// dsh web 启动时打印的认证 URL（首次使用需浏览器会话认证，`/?token=` 形式）。
+    auth_url: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
             service_child: Mutex::new(None),
+            auth_url: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// 从 dsh web 启动输出行中提取认证 URL（形如 `http://127.0.0.1:3080/?token=...`）。
+fn extract_auth_url(line: &str) -> Option<String> {
+    const MARK: &str = "dsh web: http://";
+    let idx = line.find(MARK)?;
+    let rest = &line[idx + MARK.len()..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ')')
+        .unwrap_or(rest.len());
+    let url = format!("http://{}", &rest[..end]);
+    url.contains("?token=").then_some(url)
 }
 
 // ───────────────────────── dsh 服务管理 ─────────────────────────
@@ -98,31 +113,62 @@ fn log_file_path() -> std::path::PathBuf {
     dir.join("dsh.log")
 }
 
+/// 启动 `dsh web`：stderr 落盘；stdout 用管道捕获——既追加写 dsh.log，
+/// 又实时提取"首次使用需认证"的带 token URL（存入 auth_url 供 WebView 完成认证）。
 #[cfg(windows)]
-fn start_service() -> io::Result<Child> {
-    let log = std::fs::OpenOptions::new()
+fn start_service(auth_url: Arc<Mutex<Option<String>>>) -> io::Result<Child> {
+    let err_log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_file_path())?;
-    let err = log.try_clone()?;
 
     let mut cmd = Command::new("cmd");
     cmd.args(["/C", "dsh", "web", "--no-open"])
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(err_log))
         .creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut log =
+                std::fs::OpenOptions::new().create(true).append(true).open(log_file_path()).ok();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(l) = log.as_mut() {
+                    let _ = writeln!(l, "{}", line);
+                }
+                if let Some(url) = extract_auth_url(&line) {
+                    if let Ok(mut guard) = auth_url.lock() {
+                        *guard = Some(url);
+                    }
+                }
+            }
+        });
+    }
+    Ok(child)
 }
 
 #[cfg(not(windows))]
-fn start_service() -> io::Result<Child> {
-    Command::new("dsh")
-        .args(["web", "--no-open"])
+fn start_service(auth_url: Arc<Mutex<Option<String>>>) -> io::Result<Child> {
+    let mut cmd = Command::new("dsh");
+    cmd.args(["web", "--no-open"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn()?;
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(url) = extract_auth_url(&line) {
+                    if let Ok(mut guard) = auth_url.lock() {
+                        *guard = Some(url);
+                    }
+                }
+            }
+        });
+    }
+    Ok(child)
 }
 
 #[cfg(windows)]
@@ -182,7 +228,8 @@ fn boot_dsh_once(h: &AppHandle) -> bool {
         return true;
     }
 
-    match start_service() {
+    let auth_url = h.state::<AppState>().auth_url.clone();
+    match start_service(auth_url) {
         Ok(child) => {
             eprintln!(
                 "[dsh-desktop] dsh spawned (pid={}), waiting for ready…",
@@ -197,7 +244,7 @@ fn boot_dsh_once(h: &AppHandle) -> bool {
     }
 
     if wait_ready(PORT, READY_TIMEOUT_SECS) {
-        eprintln!("[dsh-desktop] dsh ready, navigating to {}", DSH_URL);
+        eprintln!("[dsh-desktop] dsh ready, navigating…");
         navigate_to_dsh(h);
         true
     } else {
@@ -210,10 +257,22 @@ fn boot_dsh_once(h: &AppHandle) -> bool {
     }
 }
 
+/// 跳转到 dsh UI。若本次启动 dsh 打印了认证 URL（首次使用需浏览器会话认证），
+/// 则先访问带 token 的 URL（服务端种 cookie 并 303 到 /），否则直接访问根 URL。
 fn navigate_to_dsh(h: &AppHandle) {
+    // 给 dsh 打印认证 URL 留一点时间（打印发生在服务就绪附近）
+    std::thread::sleep(Duration::from_millis(600));
+    let url = h
+        .state::<AppState>()
+        .auth_url
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| DSH_URL.to_string());
+    eprintln!("[dsh-desktop] navigating to {}", url);
     if let Some(w) = h.get_webview_window("main") {
-        if let Ok(url) = DSH_URL.parse() {
-            let _ = w.navigate(url);
+        if let Ok(u) = url.parse() {
+            let _ = w.navigate(u);
         }
     }
 }
@@ -501,8 +560,8 @@ fn check_env() -> EnvInfo {
     }
 }
 
-/// 执行 `npm <pkg_args>` 并把 stdout/stderr 流式 emit 到 `env-log` 事件。
-async fn run_npm_global(app: &AppHandle, pkg_args: &[&str]) -> Result<(), String> {
+/// 执行 `npm <pkg_args>` 并把 stdout/stderr 流式 emit 到 `event`。
+async fn run_npm_global(app: &AppHandle, pkg_args: &[&str], event: &str) -> Result<(), String> {
     let mut child = Command::new("cmd")
         .args(["/C", "npm"])
         .args(pkg_args)
@@ -522,15 +581,17 @@ async fn run_npm_global(app: &AppHandle, pkg_args: &[&str]) -> Result<(), String
         .ok_or_else(|| "无法读取 npm 错误流".to_string())?;
 
     let a1 = app.clone();
+    let ev1 = event.to_string();
     let h1 = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let _ = a1.emit("env-log", line);
+            let _ = a1.emit(&ev1, line);
         }
     });
     let a2 = app.clone();
+    let ev2 = event.to_string();
     let h2 = std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let _ = a2.emit("env-log", line);
+            let _ = a2.emit(&ev2, line);
         }
     });
 
@@ -549,14 +610,14 @@ async fn run_npm_global(app: &AppHandle, pkg_args: &[&str]) -> Result<(), String
 #[tauri::command]
 async fn setup_node_env(app: AppHandle) -> Result<InstallResult, String> {
     let _ = app.emit("env-log", ">>> 安装 pnpm ...");
-    if let Err(e) = run_npm_global(&app, &["install", "-g", "pnpm"]).await {
+    if let Err(e) = run_npm_global(&app, &["install", "-g", "pnpm"], "env-log").await {
         return Ok(InstallResult {
             ok: false,
             error: Some(format!("安装 pnpm 失败：{}", e)),
         });
     }
     let _ = app.emit("env-log", ">>> 升级 npm 到最新 ...");
-    if let Err(e) = run_npm_global(&app, &["install", "-g", "npm@latest"]).await {
+    if let Err(e) = run_npm_global(&app, &["install", "-g", "npm@latest"], "env-log").await {
         return Ok(InstallResult {
             ok: false,
             error: Some(format!("升级 npm 失败：{}", e)),
@@ -564,6 +625,28 @@ async fn setup_node_env(app: AppHandle) -> Result<InstallResult, String> {
     }
     let _ = app.emit("env-log", ">>> 环境就绪 ✓");
     Ok(InstallResult { ok: true, error: None })
+}
+
+/// 更新 dsh 到最新版：先停掉正在运行的 dsh 服务，再 `npm i -g @deepseek-ai/dsh@latest`。
+/// 更新完成后由前端调用 open_dsh 重启服务。
+#[tauri::command]
+async fn update_dsh(app: AppHandle) -> Result<InstallResult, String> {
+    stop_service(&app);
+    let _ = app.emit("install-log", ">>> 正在升级 dsh 到最新版 ...");
+    match run_npm_global(&app, &["install", "-g", "@deepseek-ai/dsh@latest"], "install-log").await
+    {
+        Ok(()) => {
+            let _ = app.emit("install-log", ">>> dsh 升级完成 ✓");
+            Ok(InstallResult { ok: true, error: None })
+        }
+        Err(e) => {
+            let _ = app.emit("install-log", format!(">>> 升级失败：{}", e));
+            Ok(InstallResult {
+                ok: false,
+                error: Some(format!("dsh 升级失败：{}", e)),
+            })
+        }
+    }
 }
 
 // ───────────────────────── dsh 更新检测 ─────────────────────────
@@ -615,6 +698,9 @@ fn create_main_window(app: &AppHandle, page: &str) -> tauri::Result<()> {
         .title("DSH - DeepSeek Harness")
         .inner_size(1280.0, 820.0)
         .min_inner_size(960.0, 640.0)
+        // 禁用 WebView2 GPU 合成（软件渲染），修复 DWM 合成残影导致的
+        // 屏幕左上角"黑窗口"（dsh 高频输出 + 窗口变换时的旧帧残影）
+        .additional_browser_args("--disable-gpu")
         .center()
         .visible(true)
         .build()?;
@@ -701,6 +787,7 @@ pub fn run() {
             check_env,
             install_dsh,
             setup_node_env,
+            update_dsh,
             open_dsh
         ])
         .setup(|app| {
