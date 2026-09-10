@@ -13,3 +13,7 @@ scripts/*_preview.png
 scripts/cmp_*.png
 scripts/cmp_*.ico
 scripts/extracted.ico
+
+# 调试截图（不入库）
+scripts/*.png
+target-v0*/

@@ -26,6 +26,8 @@ const DSH_URL: &str = "http://localhost:3080";
 const READY_TIMEOUT_SECS: u64 = 60;
 const POLL_INTERVAL_MS: u64 = 300;
 const PROBE_TIMEOUT_MS: u64 = 300;
+/// 等 dsh 在 stdout 打印带 token 认证 URL 的最长时间（秒）
+const AUTH_WAIT_SECS: u64 = 8;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -113,6 +115,26 @@ fn log_file_path() -> std::path::PathBuf {
     dir.join("dsh.log")
 }
 
+fn launcher_log_path() -> std::path::PathBuf {
+    log_file_path().with_file_name("launcher.log")
+}
+
+/// 记一条启动器事件到 `%APPDATA%\dsh-desktop\launcher.log`。
+/// 正式包是 windows 子系统（无控制台），`eprintln!` 在用户机器上看不到，
+/// 排障只能靠这个文件，所以关键节点都要写。
+fn log_event(msg: impl AsRef<str>) {
+    if let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(launcher_log_path())
+    {
+        // 时间戳用 Unix 秒（std 无本地时间格式化，读取时再换算）
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{}] {}", secs, msg.as_ref());
+    }
+}
+
 /// 启动 `dsh web`：stderr 落盘；stdout 用管道捕获——既追加写 dsh.log，
 /// 又实时提取"首次使用需认证"的带 token URL（存入 auth_url 供 WebView 完成认证）。
 #[cfg(windows)]
@@ -127,8 +149,15 @@ fn start_service(auth_url: Arc<Mutex<Option<String>>>) -> io::Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(err_log))
+        // 宿主（如从其它工具链里启动本程序）可能通过 NODE_OPTIONS 给 node 注入
+        // preload 钩子，那类 shim 会改写 fs 删除语义，直接把 dsh 的原子写锁搞崩：
+        //   [safe-delete] 操作失败 ... .credentials.yaml.lock
+        // 清掉它，保证 dsh 拿到干净的环境。
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_REPL_EXTERNAL_MODULE")
         .creation_flags(CREATE_NO_WINDOW);
     let mut child = cmd.spawn()?;
+    log_event(format!("spawned: cmd /C dsh web --no-open (pid={})", child.id()));
 
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
@@ -139,11 +168,13 @@ fn start_service(auth_url: Arc<Mutex<Option<String>>>) -> io::Result<Child> {
                     let _ = writeln!(l, "{}", line);
                 }
                 if let Some(url) = extract_auth_url(&line) {
+                    log_event(format!("captured auth url from stdout: {}", url));
                     if let Ok(mut guard) = auth_url.lock() {
                         *guard = Some(url);
                     }
                 }
             }
+            log_event("dsh stdout stream closed");
         });
     }
     Ok(child)
@@ -224,7 +255,11 @@ fn start_dsh_and_open(app: &AppHandle) {
 fn boot_dsh_once(h: &AppHandle) -> bool {
     if service_running(PORT) {
         eprintln!("[dsh-desktop] dsh already listening on port {}", PORT);
-        navigate_to_dsh(h);
+        log_event(format!(
+            "port {} already in use -> reusing external dsh (no token available this run)",
+            PORT
+        ));
+        navigate_to_dsh(h, false);
         return true;
     }
 
@@ -239,13 +274,15 @@ fn boot_dsh_once(h: &AppHandle) -> bool {
         }
         Err(e) => {
             eprintln!("[dsh-desktop] failed to spawn dsh: {}", e);
+            log_event(format!("spawn failed: {}", e));
             return false;
         }
     }
 
     if wait_ready(PORT, READY_TIMEOUT_SECS) {
         eprintln!("[dsh-desktop] dsh ready, navigating…");
-        navigate_to_dsh(h);
+        log_event("port is ready");
+        navigate_to_dsh(h, true);
         true
     } else {
         eprintln!(
@@ -253,23 +290,43 @@ fn boot_dsh_once(h: &AppHandle) -> bool {
             READY_TIMEOUT_SECS,
             log_file_path()
         );
+        log_event(format!("not ready within {}s", READY_TIMEOUT_SECS));
         false
     }
 }
 
 /// 跳转到 dsh UI。若本次启动 dsh 打印了认证 URL（首次使用需浏览器会话认证），
 /// 则先访问带 token 的 URL（服务端种 cookie 并 303 到 /），否则直接访问根 URL。
-fn navigate_to_dsh(h: &AppHandle) {
-    // 给 dsh 打印认证 URL 留一点时间（打印发生在服务就绪附近）
-    std::thread::sleep(Duration::from_millis(600));
-    let url = h
-        .state::<AppState>()
-        .auth_url
-        .lock()
-        .unwrap()
-        .clone()
-        .unwrap_or_else(|| DSH_URL.to_string());
-    eprintln!("[dsh-desktop] navigating to {}", url);
+/// 等待 stdout 读取线程抓到认证 URL（最多 `timeout`）。
+/// dsh 打印这行发生在监听成功附近，时机不固定，用固定 sleep 容易落空。
+fn wait_auth_url(h: &AppHandle, timeout: Duration) -> Option<String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(u) = h.state::<AppState>().auth_url.lock().unwrap().clone() {
+            return Some(u);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
+}
+
+/// 跳转到 dsh UI。
+/// `expect_auth` 为真（服务是本次拉起的）时，先等 stdout 里那行带 token 的 URL；
+/// 拿到就先访问它（服务端种 cookie 并 303 到 /）完成认证，否则直接访问根 URL。
+fn navigate_to_dsh(h: &AppHandle, expect_auth: bool) {
+    let captured = if expect_auth {
+        wait_auth_url(h, Duration::from_secs(AUTH_WAIT_SECS))
+    } else {
+        h.state::<AppState>().auth_url.lock().unwrap().clone()
+    };
+    log_event(format!(
+        "auth url: {}",
+        match captured.as_deref() {
+            Some(u) => u.to_string(),
+            None => "none (navigating to bare /)".to_string(),
+        }
+    ));
+    let url = captured.unwrap_or_else(|| DSH_URL.to_string());
     if let Some(w) = h.get_webview_window("main") {
         if let Ok(u) = url.parse() {
             let _ = w.navigate(u);
@@ -562,11 +619,14 @@ fn check_env() -> EnvInfo {
 
 /// 执行 `npm <pkg_args>` 并把 stdout/stderr 流式 emit 到 `event`。
 async fn run_npm_global(app: &AppHandle, pkg_args: &[&str], event: &str) -> Result<(), String> {
+    log_event(format!("npm {}", pkg_args.join(" ")));
     let mut child = Command::new("cmd")
         .args(["/C", "npm"])
         .args(pkg_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_remove("NODE_OPTIONS")
+        .env_remove("NODE_REPL_EXTERNAL_MODULE")
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("无法启动 npm：{}", e))?;
@@ -631,16 +691,19 @@ async fn setup_node_env(app: AppHandle) -> Result<InstallResult, String> {
 /// 更新完成后由前端调用 open_dsh 重启服务。
 #[tauri::command]
 async fn update_dsh(app: AppHandle) -> Result<InstallResult, String> {
+    log_event("update_dsh: stopping service then npm i -g @deepseek-ai/dsh@latest");
     stop_service(&app);
     let _ = app.emit("install-log", ">>> 正在升级 dsh 到最新版 ...");
     match run_npm_global(&app, &["install", "-g", "@deepseek-ai/dsh@latest"], "install-log").await
     {
         Ok(()) => {
             let _ = app.emit("install-log", ">>> dsh 升级完成 ✓");
+            log_event("update_dsh: success");
             Ok(InstallResult { ok: true, error: None })
         }
         Err(e) => {
             let _ = app.emit("install-log", format!(">>> 升级失败：{}", e));
+            log_event(format!("update_dsh: failed: {}", e));
             Ok(InstallResult {
                 ok: false,
                 error: Some(format!("dsh 升级失败：{}", e)),
@@ -792,16 +855,28 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            log_event(format!(
+                "=== launcher start v{} ({}) ===",
+                app.package_info().version,
+                std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+            log_event(format!(
+                "NODE_OPTIONS present: {}",
+                std::env::var("NODE_OPTIONS").is_ok()
+            ));
 
             // 1. 检测 dsh CLI；根据结果选择加载引导页或正常 loading 页
             if dsh_cli_available() {
                 eprintln!("[dsh-desktop] dsh CLI detected, loading main flow");
+                log_event("dsh CLI detected on PATH");
                 if let Err(e) = create_main_window(&handle, PAGE_LOADING) {
                     eprintln!("[dsh-desktop] failed to create window: {}", e);
+                    log_event(format!("create window failed: {}", e));
                 }
                 start_dsh_and_open(&handle);
             } else {
                 eprintln!("[dsh-desktop] dsh CLI missing, showing install guide");
+                log_event("dsh CLI NOT found on PATH -> install guide");
                 if let Err(e) = create_main_window(&handle, PAGE_INSTALL) {
                     eprintln!("[dsh-desktop] failed to create install window: {}", e);
                 }
